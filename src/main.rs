@@ -1,10 +1,5 @@
-use std::collections::HashSet;
-use std::fmt::Write;
-use std::io;
-use std::path::PathBuf;
-use std::time::Duration;
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use clap::{CommandFactory, Parser};
 use clap_complete::{generate, Generator, Shell};
 use fitparser::profile::MesgNum;
@@ -13,6 +8,12 @@ use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use lazy_static::lazy_static;
 use reqwest::Client;
 use serde_json::json;
+use std::collections::HashSet;
+use std::fmt::Write;
+use std::io;
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing::{info, warn};
 
 lazy_static! {
     static ref WORKOUT_TYPES: HashSet<MesgNum> = HashSet::from_iter(vec![
@@ -38,43 +39,60 @@ struct Opts {
     parallelism: u8,
 }
 
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
     let opt: Opts = Opts::parse();
     let mut command = Opts::command();
 
     if let Some(generator) = opt.generator {
-        eprintln!("Generating completion file for {:?}...", generator);
+        info!("Generating completion file for {:?}...", generator);
         print_completions(generator, &mut command);
         return Ok(());
     }
 
     let client = reqwest::ClientBuilder::default().build()?;
-    let dir_list = opt.fit_file_dir_path.read_dir()?.collect::<Result<Vec<_>, io::Error>>()?;
+    let dir_list = opt
+        .fit_file_dir_path
+        .read_dir()?
+        .collect::<Result<Vec<_>, io::Error>>()?;
     let progress = make_progress(dir_list.len() as u64);
 
-    stream::iter(dir_list.into_iter()).map(|fit_file| {
-        let client = client.clone();
-        let opt = opt.clone();
-        async move {
-            if fit_file.path().extension().and_then(|s| s.to_str()) == Some("fit") {
-                // eprintln!("Processing FIT file: {}", fit_file.path().display());
-                let base64_content = file_as_base64(&fit_file.path())?;
-                let filename = fit_file.file_name().into_string().unwrap_or_else(|_| "unknown.fit".to_string());
-                if is_workout(&fit_file.path()).await? {
-                    do_tr_request(&client, base64_content, &opt.auth_bearer_token, filename, opt.athlete_id).await
+    stream::iter(dir_list.into_iter())
+        .map(|fit_file| {
+            let client = client.clone();
+            let opt = opt.clone();
+            async move {
+                if fit_file.path().extension().and_then(|s| s.to_str()) == Some("fit") {
+                    let base64_content = file_as_base64(&fit_file.path())?;
+                    let filename = fit_file
+                        .file_name()
+                        .into_string()
+                        .unwrap_or_else(|_| "unknown.fit".to_string());
+                    if is_workout(&fit_file.path()).await? {
+                        do_tr_request(
+                            &client,
+                            base64_content,
+                            &opt.auth_bearer_token,
+                            filename,
+                            opt.athlete_id,
+                        )
+                        .await
+                    } else {
+                        Ok(())
+                    }
                 } else {
                     Ok(())
                 }
-            } else {
-                Ok(())
             }
-        }
-    }).buffer_unordered(opt.parallelism as usize).for_each(|_| async {
-        progress.inc(1);
-        ()
-    }).await;
+        })
+        .buffer_unordered(opt.parallelism as usize)
+        .for_each(|_| async {
+            progress.inc(1);
+            ()
+        })
+        .await;
 
     Ok(())
 }
@@ -89,24 +107,37 @@ fn file_as_base64(path: &PathBuf) -> anyhow::Result<String> {
     Ok(STANDARD.encode(&buffer))
 }
 
-async fn do_tr_request(client: &Client, body: String, auth_bearer_token: &str, filename: String, athlete_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn do_tr_request(
+    client: &Client,
+    body: String,
+    auth_bearer_token: &str,
+    filename: String,
+    athlete_id: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let body = json!({
         "workoutDay": null,
         "data": body,
         "fileName": filename,
         "uploadClient": "TP Web App",
     });
-    eprintln!("Uploading FIT file: {}", filename);
-    let c = client.post(format!("https://tpapi.trainingpeaks.com/fitness/v6/athletes/{athlete_id}/workouts/filedata"))
+    info!("Uploading FIT file: {}", filename);
+    let c = client
+        .post(format!(
+            "https://tpapi.trainingpeaks.com/fitness/v6/athletes/{athlete_id}/workouts/filedata"
+        ))
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", auth_bearer_token))
         .json(&body)
         .send()
         .await?;
     if c.status().is_success() {
-        eprintln!("Successfully uploaded FIT file: {}", filename);
+        info!("Successfully uploaded FIT file: {}", filename);
     } else {
-        eprintln!("Failed to upload FIT file: {}, {}", filename, c.text().await?);
+        warn!(
+            "Failed to upload FIT file: {}, {}",
+            filename,
+            c.text().await?
+        );
     }
 
     Ok(())
@@ -135,12 +166,15 @@ fn make_progress(sample_count: u64) -> ProgressBar {
 async fn is_workout(path: &PathBuf) -> anyhow::Result<bool> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let path = path.clone();
-    rayon::spawn(move|| {
-            let mut fp = std::fs::File::open(path).unwrap();
-            let fit = fitparser::from_reader(&mut fp).unwrap();
+    rayon::spawn(move || {
+        let f = || {
+            let mut fp = std::fs::File::open(path)?;
+            let fit = fitparser::from_reader(&mut fp)?;
             let is_workout = fit.iter().any(|r| WORKOUT_TYPES.contains(&r.kind()));
-        tx.send(is_workout).unwrap();
+            anyhow::Ok(is_workout)
+        };
+        tx.send(f()).unwrap();
     });
-    let res = rx.await?;
+    let res = rx.await??;
     Ok(res)
 }
